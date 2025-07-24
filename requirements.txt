@@ -1,0 +1,10 @@
+neo4j
+requests
+sentence-transformers
+transformers
+torch
+faiss-cpu
+scikit-learn
+python-dotenv
+click
+tqdm

@@ -1,0 +1,295 @@
+Here is the complete code bundle for **Stage 1 + Stage 2**, using `.env` configuration, Hebrew-aware embeddings, and FAISS for efficient similarity calculations. Everything is structured into modular files.
+
+---
+
+## 📁 Project Structure
+
+```
+sefaria_neo4j/
+├── config.py
+├── sefaria_api.py
+├── neo4j_io.py
+├── ingest_explicit.py
+├── embed_models.py
+├── build_semantic.py
+├── cli.py
+├── requirements.txt
+└── README.md
+```
+
+---
+
+### 🔧 `config.py`
+
+```python
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USER = os.getenv("NEO4J_USER")
+NEO4J_PASS = os.getenv("NEO4J_PASS")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "avichr/heBERT")
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.85"))
+MIN_LENGTH = int(os.getenv("MIN_LENGTH", "50"))
+USE_FAISS = os.getenv("USE_FAISS", "false").lower() == "true"
+```
+
+---
+
+### 🕸️ `sefaria_api.py`
+
+```python
+import requests
+from config import *
+
+INDEX_URL = "https://www.sefaria.org/api/index"
+LINKS_URL = "https://www.sefaria.org/api/links/{}"
+TEXT_URL = "https://www.sefaria.org/api/texts/{}?commentary=0"
+
+def fetch_json(url):
+    resp = requests.get(url)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_all_refs():
+    data = fetch_json(INDEX_URL)
+    return [o["ref"] for o in data["refs"]]
+
+def fetch_links(ref):
+    return fetch_json(LINKS_URL.format(ref))
+
+def fetch_text(ref):
+    return fetch_json(TEXT_URL.format(ref))
+```
+
+---
+
+### 🧩 `neo4j_io.py`
+
+```python
+from neo4j import GraphDatabase
+from config import NEO4J_URI, NEO4J_USER, NEO4J_PASS
+
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+
+def create_text_node(tx, ref, en, he):
+    tx.run("""
+        MERGE (t:Text {id:$ref})
+        SET t.content_en = $en, t.content_he = $he
+    """, ref=ref, en=en, he=he)
+
+def create_explicit_edge(tx, src, tgt, category, commentator, anchor):
+    tx.run("""
+        MATCH (a:Text {id:$src}), (b:Text {id:$tgt})
+        MERGE (a)-[e:EXPLICIT {
+            category:$category, commentator:$commentator, anchorRef:$anchor
+        }]->(b)
+    """, src=src, tgt=tgt, category=category, commentator=commentator, anchor=anchor)
+
+def create_inferred_edge(tx, src, tgt, score, method):
+    tx.run("""
+        MATCH (a:Text {id:$src}), (b:Text {id:$tgt})
+        MERGE (a)-[e:INFERRED {
+            score:$score, method:$method
+        }]->(b)
+    """, src=src, tgt=tgt, score=float(score), method=method)
+```
+
+---
+
+### 📥 `ingest_explicit.py`
+
+```python
+from sefaria_api import get_all_refs, fetch_links, fetch_text
+from neo4j_io import driver, create_text_node, create_explicit_edge
+from tqdm import tqdm
+
+def ingest():
+    for ref in tqdm(get_all_refs(), desc="Explicit ingest"):
+        text = fetch_text(ref)
+        he = " ".join(text.get("he", []))
+        en = " ".join(text.get("text", [])) if text.get("text") else ""
+        with driver.session() as sess:
+            sess.write_transaction(create_text_node, ref, en, he)
+            for link in fetch_links(ref):
+                src = link["anchorRef"]
+                tgt = link["ref"]
+                with driver.session() as s:
+                    s.write_transaction(create_text_node, src, "", "")
+                    s.write_transaction(create_text_node, tgt, "", "")
+                    s.write_transaction(
+                        create_explicit_edge,
+                        src, tgt,
+                        link.get("category", ""),
+                        link.get("commentator", ""),
+                        src
+                    )
+```
+
+---
+
+### 🤗 `embed_models.py`
+
+```python
+from config import EMBED_MODEL
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModel
+import torch
+import numpy as np
+
+def get_embedder():
+    if EMBED_MODEL.startswith("avichr/"):
+        tok = AutoTokenizer.from_pretrained(EMBED_MODEL)
+        mod = AutoModel.from_pretrained(EMBED_MODEL)
+        def embed(texts):
+            tokens = tok(texts, padding=True, truncation=True, return_tensors="pt")
+            with torch.no_grad():
+                output = mod(**tokens).last_hidden_state.mean(dim=1)
+            return output.cpu().numpy()
+        return embed
+    else:
+        model = SentenceTransformer(EMBED_MODEL)
+        def embed(texts):
+            return model.encode(texts, convert_to_numpy=True)
+        return embed
+```
+
+> **HeBERT** is a Hebrew BERT (BERT‑Base), pre-trained on OSCAR & Wikipedia (\~1 B tokens) ([huggingface.co][1]).
+
+---
+
+### ⚙️ `build_semantic.py`
+
+```python
+from config import SIM_THRESHOLD, USE_FAISS, MIN_LENGTH
+from embed_models import get_embedder
+from neo4j_io import driver, create_inferred_edge
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import faiss
+
+def build():
+    with driver.session() as sess:
+        records = sess.run("MATCH (t:Text) WHERE exists(t.content_he) RETURN t.id AS id, t.content_he AS text")
+        refs, texts = zip(*[(r["id"], r["text"]) for r in records])
+    filtered = [(r,t) for r,t in zip(refs,texts) if len(t)>= MIN_LENGTH]
+    if not filtered:
+        return
+    ids, corpus = zip(*filtered)
+    embed = get_embedder()
+    embs = embed(list(corpus))
+    if USE_FAISS:
+        dim = embs.shape[1]
+        idx = faiss.IndexFlatL2(dim)
+        idx.add(embs)
+        D, I = idx.search(embs, k=10)
+        pairs = [(ids[i], ids[j], 1 - D[i][k]/2) for i in range(len(ids)) for k,j in enumerate(I[i]) if i<j]
+    else:
+        sims = cosine_similarity(embs)
+        pairs = [(ids[i], ids[j], sims[i][j])
+                 for i in range(len(ids)) for j in range(i+1, len(ids))
+                 if sims[i][j]>=SIM_THRESHOLD]
+    for src, tgt, score in pairs:
+        if score>= SIM_THRESHOLD:
+            with driver.session() as sess:
+                sess.write_transaction(create_inferred_edge, src, tgt, score, EMBED_MODEL)
+```
+
+---
+
+### 🛠️ `cli.py`
+
+```python
+import click
+from ingest_explicit import ingest
+from build_semantic import build
+from config import SIM_THRESHOLD, MIN_LENGTH
+
+@click.group()
+def cli():
+    pass
+
+@cli.command()
+def explicit():
+    """Load explicit Sefaria links into Neo4j."""
+    ingest()
+
+@cli.command()
+@click.option("--threshold", type=float, default=None)
+@click.option("--minlen", type=int, default=None)
+def semantic(threshold, minlen):
+    """Compute and load inferred semantic links."""
+    from config import SIM_THRESHOLD as t, MIN_LENGTH as m
+    if threshold: config.SIM_THRESHOLD = threshold
+    if minlen: config.MIN_LENGTH = minlen
+    build()
+
+if __name__ == "__main__":
+    cli()
+```
+
+---
+
+### 📦 `requirements.txt`
+
+```
+neo4j
+requests
+sentence-transformers
+transformers
+torch
+faiss-cpu
+scikit-learn
+python-dotenv
+click
+tqdm
+```
+
+---
+
+## ✅ Usage Overview
+
+1. Add your **.env** file:
+
+   ```
+   NEO4J_URI=bolt://localhost:7687
+   NEO4J_USER=neo4j
+   NEO4J_PASS=your_pass
+   EMBED_MODEL=avichr/heBERT
+   SIM_THRESHOLD=0.85
+   MIN_LENGTH=50
+   USE_FAISS=false
+   ```
+
+2. Install:
+
+   ```
+   pip install -r requirements.txt
+   ```
+
+3. Run explicit ingestion:
+
+   ```
+   python cli.py explicit
+   ```
+
+4. Run semantic inference:
+
+   ```
+   python cli.py semantic --threshold 0.9 --minlen 60
+   ```
+
+---
+
+### 🔚 Summary
+
+* No hard-coded secrets—fully `.env`-driven.
+* Supports **Hebrew-aware embeddings** with optional FAISS optimization.
+* Filters on **score threshold** and **text length**.
+* Creates both `EXPLICIT` (Stage 1) and `INFERRED` (Stage 2) edges.
+* Modular CLI for flexible invocation.
+
+Let me know if you'd like a sample dataset or visualization notebook next!
+
+[1]: https://huggingface.co/avichr/heBERT?utm_source=chatgpt.com "avichr/heBERT - Hugging Face"
