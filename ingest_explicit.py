@@ -1,12 +1,13 @@
 from sefaria_api import fetch_links, fetch_text
 from neo4j_io import driver, create_text_node, create_explicit_edge
 from tqdm import tqdm
+import logging
 
-def get_refs_from_file(path="refs.txt"):
+def get_refs_from_file(path="sefaria_trefs.txt"):
     with open(path, encoding="utf8") as f:
         return [line.strip() for line in f if line.strip()]
 
-def ingest(refs_path="refs.txt"):
+def ingest(refs_path="sefaria_trefs.txt"):
     refs = get_refs_from_file(refs_path)
     for ref in tqdm(refs, desc="?? Ingesting Texts"):
         try:
@@ -35,4 +36,4 @@ def ingest(refs_path="refs.txt"):
                             src
                         )
         except Exception as e:
-            tqdm.write(f"? Error processing {ref}: {e}")
+            logging.error(f"Error processing {ref}: {e}")
