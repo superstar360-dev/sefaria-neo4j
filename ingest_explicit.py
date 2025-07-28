@@ -19,7 +19,7 @@ def ingest(refs_path="sefaria_trefs.txt"):
                 sess.write_transaction(create_text_node, ref, he, en)
 
             links = fetch_links(ref)
-            for link in tqdm(links, desc=f"?? Links for {ref}", leave=False):
+            for link in links:
                 src = link.get("anchorRef")
                 tgt = link.get("ref")
                 tgthe = link.get("he", "")
